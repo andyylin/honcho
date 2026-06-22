@@ -31,7 +31,7 @@ STATE_PATH = Path(
 )
 
 REMOTE_BASE_URL = os.environ.get(
-    "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://192.168.1.145:11434/v1"
+    "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://192.168.1.101:11434/v1"
 )
 LOCAL_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_EMBEDDING_BASE_URL", "http://host.docker.internal:11434/v1"

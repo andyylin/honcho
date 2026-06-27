@@ -31,7 +31,7 @@ STATE_PATH = Path(
 )
 
 REMOTE_BASE_URL = os.environ.get(
-    "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://192.168.1.101:11434/v1"
+    "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://172.18.0.1:11435/v1"
 )
 LOCAL_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_EMBEDDING_BASE_URL", "http://host.docker.internal:11434/v1"
@@ -40,6 +40,7 @@ LOCAL_PROBE_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_OLLAMA_BASE_URL", "http://localhost:11434"
 )
 MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "mxbai-embed-large")
+REMOTE_FAILURE_THRESHOLD = int(os.environ.get("HONCHO_REMOTE_FAILURE_THRESHOLD", "3"))
 EMAIL_TARGET = os.environ.get("HONCHO_EMBEDDING_ALERT_TARGET", "email:andylin@gmail.com")
 EMAIL_SUBJECT = os.environ.get(
     "HONCHO_EMBEDDING_ALERT_SUBJECT", "[Hermes][Honcho] Embedding fallback"
@@ -253,7 +254,13 @@ def main() -> int:
         "remote_reason": remote_reason,
         "local_ok": local_ok,
         "local_reason": local_reason,
+        "remote_failure_threshold": REMOTE_FAILURE_THRESHOLD,
     }
+
+    raw_previous_failures = state.get("remote_failure_count", 0)
+    previous_failures = int(raw_previous_failures) if isinstance(raw_previous_failures, int | str) else 0
+    remote_failure_count = 0 if remote_ok else previous_failures + 1
+    summary["remote_failure_count"] = remote_failure_count
 
     if current_url == LOCAL_BASE_URL and not args.force:
         state.update(summary | {"last_status": "already_local"})
@@ -267,8 +274,17 @@ def main() -> int:
         return 0
 
     if remote_ok and not args.force:
-        state.update(summary | {"last_status": "remote_ok"})
+        state.update(summary | {"last_status": "remote_ok", "remote_failure_count": 0})
         save_state(state)
+        return 0
+
+    if not args.force and remote_failure_count < REMOTE_FAILURE_THRESHOLD:
+        state.update(summary | {"last_status": "remote_probe_failed_waiting"})
+        save_state(state)
+        print(
+            "[SILENT] remote probe failed "
+            f"{remote_failure_count}/{REMOTE_FAILURE_THRESHOLD}: {remote_reason}"
+        )
         return 0
 
     if not local_ok:

@@ -102,6 +102,34 @@ def probe_ollama(base: str) -> tuple[bool, str]:
     return True, f"ok models={models!r}"
 
 
+def probe_openai_embeddings(base: str) -> tuple[bool, str]:
+    """Probe the actual endpoint Honcho uses, not just Ollama /api/tags.
+
+    The SSH tunnel can answer /api/tags while the OpenAI-compatible embeddings
+    request hangs or fails. That false positive left Honcho configured to a dead
+    provider, so this watchdog must validate /v1/embeddings directly.
+    """
+    url = f"{base.rstrip('/')}/embeddings"
+    payload = json.dumps({"model": MODEL, "input": "honcho watchdog probe"}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "honcho-embed-watchdog/1"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = json.loads(resp.read(500_000).decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    try:
+        dim = len(body["data"][0]["embedding"])
+    except (KeyError, IndexError, TypeError) as exc:
+        return False, f"malformed embedding response: {type(exc).__name__}: {exc}"
+    if dim <= 0:
+        return False, "empty embedding vector"
+    return True, f"ok embedding_dim={dim}"
+
+
 def read_current_base_url() -> str:
     text = CONFIG_PATH.read_text()
     in_embedding_override = False
@@ -296,14 +324,39 @@ def main() -> int:
     state = load_state()
     current_url = read_current_base_url()
     remote_probe_base = REMOTE_BASE_URL.removesuffix("/v1")
-    remote_ok, remote_reason = probe_ollama(remote_probe_base)
-    local_ok, local_reason = probe_ollama(LOCAL_PROBE_BASE_URL)
+    remote_ok, remote_tags_reason = probe_ollama(remote_probe_base)
+    if remote_ok:
+        remote_ok, remote_reason = probe_openai_embeddings(REMOTE_BASE_URL)
+        if remote_ok:
+            remote_reason = f"{remote_tags_reason}; {remote_reason}"
+        else:
+            remote_reason = f"tags ok ({remote_tags_reason}); embeddings failed: {remote_reason}"
+    else:
+        remote_reason = remote_tags_reason
+    local_ok, local_tags_reason = probe_ollama(LOCAL_PROBE_BASE_URL)
+    if local_ok:
+        local_openai_probe_base = f"{LOCAL_PROBE_BASE_URL.rstrip('/')}/v1"
+        local_ok, local_reason = probe_openai_embeddings(local_openai_probe_base)
+        if local_ok:
+            local_reason = f"{local_tags_reason}; {local_reason}"
+        else:
+            local_reason = f"tags ok ({local_tags_reason}); embeddings failed: {local_reason}"
+    else:
+        local_reason = local_tags_reason
     repair_output = ""
     repaired_remote = False
 
     if not remote_ok and not args.dry_run:
         repair_output = repair_remote_ollama_endpoint()
-        repaired_ok, repaired_reason = probe_ollama(remote_probe_base)
+        repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
+        if repaired_ok:
+            repaired_ok, repaired_reason = probe_openai_embeddings(REMOTE_BASE_URL)
+            if repaired_ok:
+                repaired_reason = f"{repaired_tags_reason}; {repaired_reason}"
+            else:
+                repaired_reason = f"tags ok ({repaired_tags_reason}); embeddings failed: {repaired_reason}"
+        else:
+            repaired_reason = repaired_tags_reason
         if repaired_ok:
             remote_ok = True
             remote_reason = f"repaired remote endpoint; {repaired_reason}"

@@ -49,8 +49,8 @@ model = "mxbai-embed-large"
 dimensions_mode = "never"
 
 [embedding.MODEL_CONFIG.overrides]
-# MBP2020 Ollama via Pi host bridge TCP proxy; containers cannot reliably reach the Mac directly.
-base_url = "http://172.18.0.1:11435/v1"
+# Local Pi Ollama fallback; MBP2020 proxy is currently failing OpenAI-compatible embeddings.
+base_url = "http://host.docker.internal:11434/v1"
 api_key_env = "LOCAL_EMBEDDING_API_KEY"
 
 [vector_store]

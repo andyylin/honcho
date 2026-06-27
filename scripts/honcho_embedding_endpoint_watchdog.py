@@ -41,6 +41,13 @@ LOCAL_PROBE_BASE_URL = os.environ.get(
 )
 MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "mxbai-embed-large")
 REMOTE_FAILURE_THRESHOLD = int(os.environ.get("HONCHO_REMOTE_FAILURE_THRESHOLD", "3"))
+REMOTE_PROXY_SERVICE = os.environ.get(
+    "HONCHO_REMOTE_PROXY_SERVICE", "honcho-ollama-mbp2020-proxy.service"
+)
+REMOTE_SSH_TARGET = os.environ.get("HONCHO_REMOTE_SSH_TARGET", "andylin@mbp2020.local")
+REMOTE_OLLAMA_LAUNCH_AGENT = os.environ.get(
+    "HONCHO_REMOTE_OLLAMA_LAUNCH_AGENT", "com.andy.ollama-lan"
+)
 EMAIL_TARGET = os.environ.get("HONCHO_EMBEDDING_ALERT_TARGET", "email:andylin@gmail.com")
 EMAIL_SUBJECT = os.environ.get(
     "HONCHO_EMBEDDING_ALERT_SUBJECT", "[Hermes][Honcho] Embedding fallback"
@@ -160,6 +167,51 @@ def restart_honcho() -> str:
     return output
 
 
+def repair_remote_ollama_endpoint() -> str:
+    """Best-effort repair of the MBP Ollama path before falling back locally."""
+    repair_steps: list[str] = []
+
+    if REMOTE_PROXY_SERVICE:
+        code, output = run(["sudo", "-n", "systemctl", "restart", REMOTE_PROXY_SERVICE], timeout=30)
+        repair_steps.append(
+            f"sudo -n systemctl restart {REMOTE_PROXY_SERVICE}: rc={code}\n{output}"
+        )
+
+    if REMOTE_SSH_TARGET:
+        remote_cmd = f'''
+set -eu
+uid=$(id -u)
+agent={REMOTE_OLLAMA_LAUNCH_AGENT!r}
+launchctl kickstart -k "gui/$uid/$agent" 2>/dev/null || true
+for i in 1 2 3 4 5; do
+  if curl -fsS --connect-timeout 2 --max-time 8 http://127.0.0.1:11434/api/tags >/dev/null; then
+    echo "mbp_ollama_local_ok attempt=$i"
+    exit 0
+  fi
+  sleep 2
+done
+echo "mbp_ollama_local_failed"
+exit 1
+'''
+        code, output = run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                REMOTE_SSH_TARGET,
+                remote_cmd,
+            ],
+            timeout=45,
+        )
+        repair_steps.append(
+            f"ssh {REMOTE_SSH_TARGET} ollama kickstart: rc={code}\n{output}"
+        )
+
+    return "\n\n".join(repair_steps)
+
+
 def verify_container_embedding() -> str:
     snippet = r'''
 import asyncio, math
@@ -246,6 +298,18 @@ def main() -> int:
     remote_probe_base = REMOTE_BASE_URL.removesuffix("/v1")
     remote_ok, remote_reason = probe_ollama(remote_probe_base)
     local_ok, local_reason = probe_ollama(LOCAL_PROBE_BASE_URL)
+    repair_output = ""
+    repaired_remote = False
+
+    if not remote_ok and not args.dry_run:
+        repair_output = repair_remote_ollama_endpoint()
+        repaired_ok, repaired_reason = probe_ollama(remote_probe_base)
+        if repaired_ok:
+            remote_ok = True
+            remote_reason = f"repaired remote endpoint; {repaired_reason}"
+            repaired_remote = True
+        else:
+            remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
     summary = {
         "time": now(),
@@ -255,6 +319,8 @@ def main() -> int:
         "local_ok": local_ok,
         "local_reason": local_reason,
         "remote_failure_threshold": REMOTE_FAILURE_THRESHOLD,
+        "repaired_remote": repaired_remote,
+        "repair_output": repair_output,
     }
 
     raw_previous_failures = state.get("remote_failure_count", 0)

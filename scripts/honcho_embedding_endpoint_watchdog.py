@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fail Honcho embedding compute back to local Ollama when MBP2020 is offline.
+"""Keep Honcho embeddings on the best healthy Ollama endpoint.
 
-This watchdog is intentionally one-way: it switches remote -> local and emails Andy.
-It does not automatically switch back to the laptop, because changing embedding runtime
-while Honcho is healthy should be a deliberate operator action.
+The watchdog falls back from MBP2020 to local Pi Ollama after repeated remote
+embedding failures. While local fallback is active, it periodically performs
+bounded safe repairs of the MBP path and switches Honcho back only after the
+actual remote embeddings endpoint passes consecutive checks.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -41,6 +43,17 @@ LOCAL_PROBE_BASE_URL = os.environ.get(
 )
 MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "mxbai-embed-large")
 REMOTE_FAILURE_THRESHOLD = int(os.environ.get("HONCHO_REMOTE_FAILURE_THRESHOLD", "3"))
+REMOTE_RESTORE_SUCCESS_THRESHOLD = int(
+    os.environ.get("HONCHO_REMOTE_RESTORE_SUCCESS_THRESHOLD", "3")
+)
+REMOTE_REPAIR_INTERVAL_SECONDS = int(
+    float(os.environ.get("HONCHO_REMOTE_REPAIR_INTERVAL_MINUTES", "15")) * 60
+)
+REMOTE_AUTO_RESTORE = os.environ.get("HONCHO_REMOTE_AUTO_RESTORE", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 REMOTE_PROXY_SERVICE = os.environ.get(
     "HONCHO_REMOTE_PROXY_SERVICE", "honcho-ollama-mbp2020-proxy.service"
 )
@@ -266,7 +279,7 @@ asyncio.run(main())
     return output
 
 
-def send_email(body: str) -> str:
+def send_email(body: str, *, subject: str = EMAIL_SUBJECT) -> str:
     if not Path(HERMES_BIN).exists():
         return f"hermes binary missing at {HERMES_BIN}; email not sent"
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as fh:
@@ -274,12 +287,12 @@ def send_email(body: str) -> str:
         path = fh.name
     try:
         code, output = run(
-            [HERMES_BIN, "send", "--quiet", "--to", EMAIL_TARGET, "--subject", EMAIL_SUBJECT, "--file", path],
+            [HERMES_BIN, "send", "--quiet", "--to", EMAIL_TARGET, "--subject", subject, "--file", path],
             timeout=60,
         )
         if code != 0:
             return f"email send failed ({code}): {output}"
-        return f"email sent to {EMAIL_TARGET} subject={EMAIL_SUBJECT!r}"
+        return f"email sent to {EMAIL_TARGET} subject={subject!r}"
     finally:
         try:
             Path(path).unlink()
@@ -287,7 +300,9 @@ def send_email(body: str) -> str:
             pass
 
 
-def build_body(*, old_url: str, remote_reason: str, local_probe: str, restart_output: str, verify_output: str) -> str:
+def build_fallback_body(
+    *, old_url: str, remote_reason: str, local_probe: str, restart_output: str, verify_output: str
+) -> str:
     return f"""## Honcho embedding fallback activated
 
 Honcho was configured to use MBP2020 for embeddings, but the remote Ollama endpoint failed. I switched Honcho back to local Pi Ollama and restarted the Honcho API/deriver containers.
@@ -315,10 +330,54 @@ Honcho was configured to use MBP2020 for embeddings, but the remote Ollama endpo
 """
 
 
+def build_restore_body(
+    *, old_url: str, remote_reason: str, restart_output: str, verify_output: str, repair_output: str
+) -> str:
+    return f"""## Honcho embedding restored to MBP2020
+
+The fallback watchdog confirmed MBP2020's actual embedding endpoint is healthy for {REMOTE_RESTORE_SUCCESS_THRESHOLD} consecutive checks. I switched Honcho back to the MBP2020 Ollama bridge and restarted the Honcho API/deriver containers.
+
+- **Host:** {socket.gethostname()}
+- **Time:** {now()}
+- **Old endpoint:** `{old_url}`
+- **New endpoint:** `{REMOTE_BASE_URL}`
+- **Remote probe:** `{remote_reason}`
+- **Model:** `{MODEL}`
+
+### Repair output
+```text
+{repair_output or 'no repair needed'}
+```
+
+### Restart output
+```text
+{restart_output}
+```
+
+### Verification output
+```text
+{verify_output}
+```
+
+### Reference
+`REF: HERMES-NOTIFY:honcho:embedding-restore:mbp2020-online`
+"""
+
+
+def should_repair_remote_from_local(state: dict[str, object]) -> bool:
+    raw = state.get("last_remote_repair_attempt_epoch", 0)
+    try:
+        last_attempt = float(raw) if isinstance(raw, int | float | str) else 0.0
+    except (TypeError, ValueError):
+        last_attempt = 0.0
+    return (time.time() - last_attempt) >= REMOTE_REPAIR_INTERVAL_SECONDS
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="probe and report without changing config")
     parser.add_argument("--force", action="store_true", help="force fallback even if remote probe passes")
+    parser.add_argument("--restore-now", action="store_true", help="switch local fallback back to remote after one passing remote probe")
     args = parser.parse_args()
 
     state = load_state()
@@ -346,11 +405,29 @@ def main() -> int:
     repair_output = ""
     repaired_remote = False
 
-    # Once Honcho is already on the local fallback, keep the remote probe
-    # observational. The repair path restarts the SSH tunnel and kickstarts the
-    # Mac LaunchAgent; doing that every two minutes while local is active is
-    # pointless churn and can make a recovered Mac look flaky again.
     current_is_local = current_url == LOCAL_BASE_URL and not args.force
+
+    # If local fallback is active, periodically try to heal the MBP path and
+    # automatically restore only after repeated successful real embedding probes.
+    if current_is_local and not remote_ok and not args.dry_run and should_repair_remote_from_local(state):
+        state["last_remote_repair_attempt_epoch"] = time.time()
+        state["last_remote_repair_attempt"] = now()
+        repair_output = repair_remote_ollama_endpoint()
+        repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
+        if repaired_ok:
+            repaired_ok, repaired_reason = probe_openai_embeddings(REMOTE_BASE_URL)
+            if repaired_ok:
+                repaired_reason = f"{repaired_tags_reason}; {repaired_reason}"
+            else:
+                repaired_reason = f"tags ok ({repaired_tags_reason}); embeddings failed: {repaired_reason}"
+        else:
+            repaired_reason = repaired_tags_reason
+        if repaired_ok:
+            remote_ok = True
+            remote_reason = f"repaired remote endpoint; {repaired_reason}"
+            repaired_remote = True
+        else:
+            remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
     if not remote_ok and not args.dry_run and not current_is_local:
         repair_output = repair_remote_ollama_endpoint()
@@ -370,6 +447,13 @@ def main() -> int:
         else:
             remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
+    raw_previous_failures = state.get("remote_failure_count", 0)
+    previous_failures = int(raw_previous_failures) if isinstance(raw_previous_failures, int | str) else 0
+    remote_failure_count = 0 if remote_ok else previous_failures + 1
+    raw_previous_successes = state.get("remote_success_count", 0)
+    previous_successes = int(raw_previous_successes) if isinstance(raw_previous_successes, int | str) else 0
+    remote_success_count = previous_successes + 1 if remote_ok else 0
+
     summary = {
         "time": now(),
         "current_url": current_url,
@@ -378,18 +462,76 @@ def main() -> int:
         "local_ok": local_ok,
         "local_reason": local_reason,
         "remote_failure_threshold": REMOTE_FAILURE_THRESHOLD,
+        "remote_restore_success_threshold": REMOTE_RESTORE_SUCCESS_THRESHOLD,
+        "remote_failure_count": remote_failure_count,
+        "remote_success_count": remote_success_count,
+        "remote_auto_restore": REMOTE_AUTO_RESTORE,
+        "remote_repair_interval_seconds": REMOTE_REPAIR_INTERVAL_SECONDS,
         "repaired_remote": repaired_remote,
         "repair_output": repair_output,
     }
 
-    raw_previous_failures = state.get("remote_failure_count", 0)
-    previous_failures = int(raw_previous_failures) if isinstance(raw_previous_failures, int | str) else 0
-    remote_failure_count = 0 if remote_ok else previous_failures + 1
-    summary["remote_failure_count"] = remote_failure_count
-
     if current_is_local:
-        state.update(summary | {"last_status": "already_local"})
+        should_restore = (
+            REMOTE_AUTO_RESTORE
+            and remote_ok
+            and (args.restore_now or remote_success_count >= REMOTE_RESTORE_SUCCESS_THRESHOLD)
+        )
+        if args.dry_run:
+            action = "would_switch_to" if should_restore else "would_stay_on"
+            target = REMOTE_BASE_URL if should_restore else LOCAL_BASE_URL
+            print(json.dumps(summary | {action: target}, indent=2))
+            return 0
+        if not should_restore:
+            state.update(summary | {"last_status": "already_local"})
+            save_state(state)
+            return 0
+
+        changed = replace_embedding_base_url(REMOTE_BASE_URL)
+        restart_output = restart_honcho() if changed else "config already remote; restart skipped"
+        try:
+            verify_output = verify_container_embedding()
+        except Exception as exc:
+            rollback_changed = replace_embedding_base_url(LOCAL_BASE_URL)
+            rollback_output = restart_honcho() if rollback_changed else "rollback skipped; config already local"
+            rollback_verify = verify_container_embedding()
+            state.update(
+                summary
+                | {
+                    "last_status": "restore_verification_failed_rolled_back",
+                    "restore_error": str(exc),
+                    "rollback_output": rollback_output,
+                    "rollback_verify_output": rollback_verify,
+                }
+            )
+            save_state(state)
+            print(
+                "Honcho embedding restore BLOCKED: remote verification failed; "
+                f"rolled back to local. error={exc}"
+            )
+            return 2
+        body = build_restore_body(
+            old_url=current_url,
+            remote_reason=str(remote_reason),
+            restart_output=restart_output,
+            verify_output=verify_output,
+            repair_output=repair_output,
+        )
+        email_result = send_email(
+            body, subject="[Hermes][Honcho] Embedding restored to MBP2020"
+        )
+        state.update(
+            summary
+            | {
+                "last_status": "restored_to_remote",
+                "restored_at": now(),
+                "email_result": email_result,
+                "remote_success_count": 0,
+                "verify_output": verify_output,
+            }
+        )
         save_state(state)
+        print(f"Honcho embedding restored: {current_url} -> {REMOTE_BASE_URL}; {email_result}")
         return 0
 
     if current_url != REMOTE_BASE_URL and not args.force:
@@ -425,7 +567,7 @@ def main() -> int:
     changed = replace_embedding_base_url(LOCAL_BASE_URL)
     restart_output = restart_honcho() if changed or args.force else "config already local; restart skipped"
     verify_output = verify_container_embedding()
-    body = build_body(
+    body = build_fallback_body(
         old_url=current_url,
         remote_reason=str(remote_reason),
         local_probe=str(local_reason),

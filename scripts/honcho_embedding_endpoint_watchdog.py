@@ -31,6 +31,12 @@ STATE_PATH = Path(
         "/home/pi/.cache/honcho-embedding-endpoint-watchdog.json",
     )
 )
+DIGEST_EVENTS_PATH = Path(
+    os.environ.get(
+        "HONCHO_EMBEDDING_DIGEST_EVENTS",
+        "/home/pi/.hermes/data/automation-failure-repair/digest-events.jsonl",
+    )
+)
 
 REMOTE_BASE_URL = os.environ.get(
     "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://172.18.0.1:11435/v1"
@@ -65,6 +71,7 @@ EMAIL_TARGET = os.environ.get("HONCHO_EMBEDDING_ALERT_TARGET", "email:andylin@gm
 EMAIL_SUBJECT = os.environ.get(
     "HONCHO_EMBEDDING_ALERT_SUBJECT", "[Hermes][Honcho] Embedding fallback"
 )
+NOTIFY_MODE = os.environ.get("HONCHO_EMBEDDING_NOTIFY_MODE", "digest").strip().lower()
 HERMES_BIN = os.environ.get("HERMES_BIN", "/home/pi/.local/bin/hermes")
 
 BASE_URL_RE = re.compile(
@@ -88,6 +95,20 @@ def save_state(state: dict[str, object]) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
     tmp.replace(STATE_PATH)
+
+
+def append_digest_event(event: dict[str, object]) -> None:
+    """Record routine fallback/restore outcomes for the daily Supervisor digest."""
+    DIGEST_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "incident_id": "honcho-embedding-endpoint-watchdog",
+        "source": "honcho",
+        "name": "Honcho embedding endpoint watchdog",
+    }
+    payload.update(event)
+    with DIGEST_EVENTS_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def http_json(url: str, timeout: float = 4.0) -> tuple[bool, object | str]:
@@ -300,6 +321,19 @@ def send_email(body: str, *, subject: str = EMAIL_SUBJECT) -> str:
             pass
 
 
+def routine_notification(body: str, *, subject: str, event: dict[str, object]) -> str:
+    """Notify for successful self-healing without spamming Andy.
+
+    Fallback-to-local and restore-to-MBP are routine successful repairs. By
+    default they go to the daily Supervisor digest. Set
+    HONCHO_EMBEDDING_NOTIFY_MODE=immediate only while debugging the watchdog.
+    """
+    append_digest_event(event)
+    if NOTIFY_MODE in {"immediate", "email", "all"}:
+        return send_email(body, subject=subject)
+    return f"digest event recorded at {DIGEST_EVENTS_PATH}"
+
+
 def build_fallback_body(
     *, old_url: str, remote_reason: str, local_probe: str, restart_output: str, verify_output: str
 ) -> str:
@@ -505,9 +539,25 @@ def main() -> int:
                 }
             )
             save_state(state)
+            append_digest_event(
+                {
+                    "event": "supervisor_triage_completed",
+                    "status": "restore_verification_failed_rolled_back",
+                    "outcome": "blocked",
+                    "notification": "immediate_email",
+                    "reason": f"Remote restore verification failed and watchdog rolled back to local: {exc}",
+                    "repair": "Rolled Honcho embedding base_url back to local fallback and restarted Honcho api/deriver.",
+                    "verification": rollback_verify[:1000],
+                }
+            )
+            email_result = send_email(
+                "Honcho embedding restore BLOCKED: remote verification failed; "
+                f"rolled back to local.\n\nError:\n{exc}\n\nRollback verification:\n{rollback_verify}",
+                subject="[Hermes][Honcho] Embedding restore blocked",
+            )
             print(
                 "Honcho embedding restore BLOCKED: remote verification failed; "
-                f"rolled back to local. error={exc}"
+                f"rolled back to local. error={exc}; {email_result}"
             )
             return 2
         body = build_restore_body(
@@ -517,21 +567,31 @@ def main() -> int:
             verify_output=verify_output,
             repair_output=repair_output,
         )
-        email_result = send_email(
-            body, subject="[Hermes][Honcho] Embedding restored to MBP2020"
+        notify_result = routine_notification(
+            body,
+            subject="[Hermes][Honcho] Embedding restored to MBP2020",
+            event={
+                "event": "supervisor_auto_repair_completed",
+                "status": "restored_to_remote",
+                "outcome": "silent_digest",
+                "notification": "silent_digest_ledger_only",
+                "reason": f"Honcho embeddings restored to MBP2020 after {remote_success_count} consecutive healthy remote checks.",
+                "repair": f"Switched embedding base_url from {current_url} to {REMOTE_BASE_URL}; restarted Honcho api/deriver.",
+                "verification": verify_output[:1000],
+            },
         )
         state.update(
             summary
             | {
                 "last_status": "restored_to_remote",
                 "restored_at": now(),
-                "email_result": email_result,
+                "notification_result": notify_result,
                 "remote_success_count": 0,
                 "verify_output": verify_output,
             }
         )
         save_state(state)
-        print(f"Honcho embedding restored: {current_url} -> {REMOTE_BASE_URL}; {email_result}")
+        print(f"Honcho embedding restored: {current_url} -> {REMOTE_BASE_URL}; {notify_result}")
         return 0
 
     if current_url != REMOTE_BASE_URL and not args.force:
@@ -557,7 +617,25 @@ def main() -> int:
     if not local_ok:
         state.update(summary | {"last_status": "blocked_local_unhealthy"})
         save_state(state)
-        print(f"Honcho embedding fallback BLOCKED: remote failed ({remote_reason}); local failed ({local_reason})")
+        append_digest_event(
+            {
+                "event": "supervisor_triage_completed",
+                "status": "fallback_blocked_local_unhealthy",
+                "outcome": "blocked",
+                "notification": "immediate_email",
+                "reason": f"Remote failed ({remote_reason}); local fallback also failed ({local_reason}).",
+                "repair": "No config change applied because fallback target is unhealthy.",
+            }
+        )
+        email_result = send_email(
+            "Honcho embedding fallback BLOCKED: remote and local embedding providers failed.\n\n"
+            f"Remote: {remote_reason}\n\nLocal: {local_reason}",
+            subject="[Hermes][Honcho] Embedding fallback blocked",
+        )
+        print(
+            f"Honcho embedding fallback BLOCKED: remote failed ({remote_reason}); "
+            f"local failed ({local_reason}); {email_result}"
+        )
         return 2
 
     if args.dry_run:
@@ -574,18 +652,30 @@ def main() -> int:
         restart_output=restart_output,
         verify_output=verify_output,
     )
-    email_result = send_email(body)
+    notify_result = routine_notification(
+        body,
+        subject=EMAIL_SUBJECT,
+        event={
+            "event": "supervisor_auto_repair_completed",
+            "status": "switched_to_local",
+            "outcome": "silent_digest",
+            "notification": "silent_digest_ledger_only",
+            "reason": f"Honcho remote embeddings failed {remote_failure_count}/{REMOTE_FAILURE_THRESHOLD}; local fallback verified healthy.",
+            "repair": f"Switched embedding base_url from {current_url} to {LOCAL_BASE_URL}; restarted Honcho api/deriver.",
+            "verification": verify_output[:1000],
+        },
+    )
     state.update(
         summary
         | {
             "last_status": "switched_to_local",
             "switched_at": now(),
-            "email_result": email_result,
+            "notification_result": notify_result,
             "verify_output": verify_output,
         }
     )
     save_state(state)
-    print(f"Honcho embedding fallback activated: {current_url} -> {LOCAL_BASE_URL}; {email_result}")
+    print(f"Honcho embedding fallback activated: {current_url} -> {LOCAL_BASE_URL}; {notify_result}")
     return 0
 
 

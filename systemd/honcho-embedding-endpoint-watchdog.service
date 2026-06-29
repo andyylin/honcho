@@ -15,9 +15,10 @@ Environment=HONCHO_DIR=/home/pi/honcho
 Environment=HONCHO_REMOTE_EMBEDDING_BASE_URL=http://172.18.0.1:11435/v1
 Environment=HONCHO_LOCAL_EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
 Environment=HONCHO_LOCAL_OLLAMA_BASE_URL=http://localhost:11434
-Environment=HONCHO_REMOTE_RESTORE_SUCCESS_THRESHOLD=3
-Environment=HONCHO_REMOTE_REPAIR_INTERVAL_MINUTES=15
+Environment=HONCHO_REMOTE_RESTORE_SUCCESS_THRESHOLD=15
+Environment=HONCHO_REMOTE_REPAIR_INTERVAL_MINUTES=30
 Environment=HONCHO_REMOTE_AUTO_RESTORE=1
+Environment=HONCHO_EMBEDDING_NOTIFY_MODE=digest
 Environment=HONCHO_EMBEDDING_ALERT_TARGET=email:andylin@gmail.com
 Environment="HONCHO_EMBEDDING_ALERT_SUBJECT=[Hermes][Honcho] Embedding fallback"
 ExecStart=/usr/bin/python3 /home/pi/honcho/scripts/honcho_embedding_endpoint_watchdog.py

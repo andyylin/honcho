@@ -346,7 +346,13 @@ def main() -> int:
     repair_output = ""
     repaired_remote = False
 
-    if not remote_ok and not args.dry_run:
+    # Once Honcho is already on the local fallback, keep the remote probe
+    # observational. The repair path restarts the SSH tunnel and kickstarts the
+    # Mac LaunchAgent; doing that every two minutes while local is active is
+    # pointless churn and can make a recovered Mac look flaky again.
+    current_is_local = current_url == LOCAL_BASE_URL and not args.force
+
+    if not remote_ok and not args.dry_run and not current_is_local:
         repair_output = repair_remote_ollama_endpoint()
         repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
         if repaired_ok:
@@ -381,7 +387,7 @@ def main() -> int:
     remote_failure_count = 0 if remote_ok else previous_failures + 1
     summary["remote_failure_count"] = remote_failure_count
 
-    if current_url == LOCAL_BASE_URL and not args.force:
+    if current_is_local:
         state.update(summary | {"last_status": "already_local"})
         save_state(state)
         return 0

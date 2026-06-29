@@ -49,8 +49,9 @@ model = "mxbai-embed-large"
 dimensions_mode = "never"
 
 [embedding.MODEL_CONFIG.overrides]
-# MBP2020 Ollama via Pi host bridge SSH tunnel; containers cannot reliably reach the Mac directly.
-base_url = "http://172.18.0.1:11435/v1"
+# Local Pi Ollama fallback is active. Remote MBP2020 bridge is http://172.18.0.1:11435/v1
+# and should only be restored deliberately after verification.
+base_url = "http://host.docker.internal:11434/v1"
 api_key_env = "LOCAL_EMBEDDING_API_KEY"
 
 [vector_store]

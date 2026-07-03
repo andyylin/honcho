@@ -51,7 +51,7 @@ dimensions_mode = "never"
 [embedding.MODEL_CONFIG.overrides]
 # Preferred MBP2020 Ollama bridge. The watchdog can fall back to local Pi Ollama
 # at http://host.docker.internal:11434/v1 and auto-restore after verified health.
-base_url = "http://host.docker.internal:11434/v1"
+base_url = "http://172.18.0.1:11435/v1"
 api_key_env = "LOCAL_EMBEDDING_API_KEY"
 
 [vector_store]

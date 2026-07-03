@@ -10,13 +10,13 @@ actual remote embeddings endpoint passes consecutive checks.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
 import re
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -48,6 +48,9 @@ LOCAL_PROBE_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_OLLAMA_BASE_URL", "http://localhost:11434"
 )
 MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "mxbai-embed-large")
+EMBEDDING_PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get("HONCHO_EMBEDDING_PROBE_TIMEOUT_SECONDS", "30")
+)
 REMOTE_FAILURE_THRESHOLD = int(os.environ.get("HONCHO_REMOTE_FAILURE_THRESHOLD", "3"))
 REMOTE_RESTORE_SUCCESS_THRESHOLD = int(
     os.environ.get("HONCHO_REMOTE_RESTORE_SUCCESS_THRESHOLD", "3")
@@ -119,7 +122,7 @@ def http_json(url: str, timeout: float = 4.0) -> tuple[bool, object | str]:
             if resp.status != 200:
                 return False, f"HTTP {resp.status}"
             return True, json.loads(body.decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -151,9 +154,9 @@ def probe_openai_embeddings(base: str) -> tuple[bool, str]:
         headers={"Content-Type": "application/json", "User-Agent": "honcho-embed-watchdog/1"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=EMBEDDING_PROBE_TIMEOUT_SECONDS) as resp:
             body = json.loads(resp.read(500_000).decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
     try:
         dim = len(body["data"][0]["embedding"])
@@ -315,10 +318,8 @@ def send_email(body: str, *, subject: str = EMAIL_SUBJECT) -> str:
             return f"email send failed ({code}): {output}"
         return f"email sent to {EMAIL_TARGET} subject={subject!r}"
     finally:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             Path(path).unlink()
-        except FileNotFoundError:
-            pass
 
 
 def routine_notification(body: str, *, subject: str, event: dict[str, object]) -> str:

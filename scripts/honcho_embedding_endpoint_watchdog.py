@@ -214,14 +214,22 @@ def replace_embedding_base_url(new_url: str) -> bool:
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, timeout: int = 120) -> tuple[int, str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial_output = exc.stdout or ""
+        if isinstance(partial_output, bytes):
+            partial_output = partial_output.decode(errors="replace")
+        detail = partial_output.strip()
+        message = f"command timed out after {timeout}s"
+        return 124, f"{message}\n{detail}" if detail else message
     return proc.returncode, proc.stdout.strip()
 
 

@@ -122,7 +122,12 @@ def http_json(url: str, timeout: float = 4.0) -> tuple[bool, object | str]:
             if resp.status != 200:
                 return False, f"HTTP {resp.status}"
             return True, json.loads(body.decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except (
+        urllib.error.URLError,
+        ConnectionError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
 
@@ -156,7 +161,12 @@ def probe_openai_embeddings(base: str) -> tuple[bool, str]:
     try:
         with urllib.request.urlopen(req, timeout=EMBEDDING_PROBE_TIMEOUT_SECONDS) as resp:
             body = json.loads(resp.read(500_000).decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except (
+        urllib.error.URLError,
+        ConnectionError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as exc:
         return False, f"{type(exc).__name__}: {exc}"
     try:
         dim = len(body["data"][0]["embedding"])

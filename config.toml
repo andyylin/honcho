@@ -122,7 +122,7 @@ MAX_TOOL_ITERATIONS = 5
 TOOL_CHOICE = "auto"
 [dialectic.LEVELS.low.MODEL_CONFIG]
 transport = "openai"
-model = "deepseek/deepseek-v4-pro"
+model = "openai/gpt-5-mini"
 thinking_effort = "low"
 [dialectic.LEVELS.low.MODEL_CONFIG.overrides]
 base_url = "https://openrouter.ai/api/v1"
@@ -132,7 +132,7 @@ api_key_env = "LLM_OPENAI_API_KEY"
 MAX_TOOL_ITERATIONS = 2
 [dialectic.LEVELS.medium.MODEL_CONFIG]
 transport = "openai"
-model = "deepseek/deepseek-v4-pro"
+model = "openai/gpt-5-mini"
 thinking_effort = "low"
 [dialectic.LEVELS.medium.MODEL_CONFIG.overrides]
 base_url = "https://openrouter.ai/api/v1"

@@ -438,6 +438,7 @@ def main() -> int:
 
     state = load_state()
     current_url = read_current_base_url()
+    current_is_local = current_url == LOCAL_BASE_URL and not args.force
     remote_probe_base = REMOTE_BASE_URL.removesuffix("/v1")
     remote_ok, remote_tags_reason = probe_ollama(remote_probe_base)
     if remote_ok:
@@ -448,20 +449,29 @@ def main() -> int:
             remote_reason = f"tags ok ({remote_tags_reason}); embeddings failed: {remote_reason}"
     else:
         remote_reason = remote_tags_reason
-    local_ok, local_tags_reason = probe_ollama(LOCAL_PROBE_BASE_URL)
-    if local_ok:
-        local_openai_probe_base = f"{LOCAL_PROBE_BASE_URL.rstrip('/')}/v1"
-        local_ok, local_reason = probe_openai_embeddings(local_openai_probe_base)
+    # Only prove the local endpoint when it is a candidate fallback target.
+    # Probing it while Honcho already runs locally adds an expensive embedding
+    # request every two minutes and can worsen the very queue saturation the
+    # watchdog is meant to survive. Honcho's own health check covers the active
+    # provider; the watchdog verifies local embeddings immediately before a
+    # remote-to-local switch.
+    should_probe_local_fallback = not current_is_local and (args.force or not remote_ok)
+    if should_probe_local_fallback:
+        local_ok, local_tags_reason = probe_ollama(LOCAL_PROBE_BASE_URL)
         if local_ok:
-            local_reason = f"{local_tags_reason}; {local_reason}"
+            local_openai_probe_base = f"{LOCAL_PROBE_BASE_URL.rstrip('/')}/v1"
+            local_ok, local_reason = probe_openai_embeddings(local_openai_probe_base)
+            if local_ok:
+                local_reason = f"{local_tags_reason}; {local_reason}"
+            else:
+                local_reason = f"tags ok ({local_tags_reason}); embeddings failed: {local_reason}"
         else:
-            local_reason = f"tags ok ({local_tags_reason}); embeddings failed: {local_reason}"
+            local_reason = local_tags_reason
     else:
-        local_reason = local_tags_reason
+        local_ok = True
+        local_reason = "probe skipped; local endpoint is active or not needed as fallback"
     repair_output = ""
     repaired_remote = False
-
-    current_is_local = current_url == LOCAL_BASE_URL and not args.force
 
     # If local fallback is active, periodically try to heal the MBP path and
     # automatically restore only after repeated successful real embedding probes.

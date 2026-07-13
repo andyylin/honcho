@@ -48,8 +48,11 @@ LOCAL_PROBE_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_OLLAMA_BASE_URL", "http://localhost:11434"
 )
 MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "mxbai-embed-large")
+# The Pi fallback can legitimately take 30-45 seconds while Ollama loads or
+# contends for memory. Keep the watchdog above that observed cold-path latency
+# so a slow but healthy local provider is not misclassified as unavailable.
 EMBEDDING_PROBE_TIMEOUT_SECONDS = float(
-    os.environ.get("HONCHO_EMBEDDING_PROBE_TIMEOUT_SECONDS", "30")
+    os.environ.get("HONCHO_EMBEDDING_PROBE_TIMEOUT_SECONDS", "60")
 )
 REMOTE_FAILURE_THRESHOLD = int(os.environ.get("HONCHO_REMOTE_FAILURE_THRESHOLD", "3"))
 REMOTE_RESTORE_SUCCESS_THRESHOLD = int(

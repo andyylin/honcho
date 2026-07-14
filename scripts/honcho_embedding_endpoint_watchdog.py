@@ -470,12 +470,27 @@ def main() -> int:
     else:
         local_ok = True
         local_reason = "probe skipped; local endpoint is active or not needed as fallback"
+    raw_previous_failures = state.get("remote_failure_count", 0)
+    previous_failures = int(raw_previous_failures) if isinstance(raw_previous_failures, int | str) else 0
+    candidate_failure_count = 0 if remote_ok else previous_failures + 1
     repair_output = ""
     repaired_remote = False
 
+    # Under embedding load one probe can miss its deadline while the endpoint
+    # remains healthy. Restarting the shared SSH tunnel on the first miss drops
+    # every in-flight Honcho and GBrain request. Repair only after the same
+    # consecutive-failure threshold that authorizes fallback.
+    repair_threshold_reached = candidate_failure_count >= REMOTE_FAILURE_THRESHOLD
+
     # If local fallback is active, periodically try to heal the MBP path and
     # automatically restore only after repeated successful real embedding probes.
-    if current_is_local and not remote_ok and not args.dry_run and should_repair_remote_from_local(state):
+    if (
+        current_is_local
+        and not remote_ok
+        and repair_threshold_reached
+        and not args.dry_run
+        and should_repair_remote_from_local(state)
+    ):
         state["last_remote_repair_attempt_epoch"] = time.time()
         state["last_remote_repair_attempt"] = now()
         repair_output = repair_remote_ollama_endpoint()
@@ -495,7 +510,12 @@ def main() -> int:
         else:
             remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
-    if not remote_ok and not args.dry_run and not current_is_local:
+    if (
+        not remote_ok
+        and repair_threshold_reached
+        and not args.dry_run
+        and not current_is_local
+    ):
         repair_output = repair_remote_ollama_endpoint()
         repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
         if repaired_ok:
@@ -513,8 +533,6 @@ def main() -> int:
         else:
             remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
-    raw_previous_failures = state.get("remote_failure_count", 0)
-    previous_failures = int(raw_previous_failures) if isinstance(raw_previous_failures, int | str) else 0
     remote_failure_count = 0 if remote_ok else previous_failures + 1
     raw_previous_successes = state.get("remote_success_count", 0)
     previous_successes = int(raw_previous_successes) if isinstance(raw_previous_successes, int | str) else 0

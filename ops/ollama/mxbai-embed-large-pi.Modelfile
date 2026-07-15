@@ -1,0 +1,10 @@
+# Pi-local wrapper for Ollama 0.24.0 on ARM CPU.
+#
+# The stock four-thread runner intermittently returns NaN for mxbai embeddings.
+# A one-thread request was stable, including repeated cold-load probes. The source
+# alias preserves the original manifest for rollback without duplicating the blob.
+#
+# Apply with:
+#   ollama create mxbai-embed-large -f ops/ollama/mxbai-embed-large-pi.Modelfile
+FROM mxbai-embed-large-pre-num-thread-20260715:latest
+PARAMETER num_thread 1

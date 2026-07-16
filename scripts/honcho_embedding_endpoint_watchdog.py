@@ -70,7 +70,7 @@ REMOTE_PROXY_SERVICE = os.environ.get(
     "HONCHO_REMOTE_PROXY_SERVICE", "honcho-ollama-mbp2020-proxy.service"
 )
 REMOTE_SSH_TARGET = os.environ.get(
-    "HONCHO_REMOTE_SSH_TARGET", "andylin@mbp2020.tail9e793a.ts.net"
+    "HONCHO_REMOTE_SSH_TARGET", "andylin@mbp2020.local"
 )
 REMOTE_OLLAMA_LAUNCH_AGENT = os.environ.get(
     "HONCHO_REMOTE_OLLAMA_LAUNCH_AGENT", "com.andy.ollama-lan"

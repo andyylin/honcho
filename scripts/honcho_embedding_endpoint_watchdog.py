@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Keep Honcho embeddings on the best healthy Ollama endpoint.
+"""Keep Honcho embeddings on the best healthy remote Ollama endpoint.
 
-The watchdog falls back from MBP2020 to local Pi Ollama after repeated remote
-embedding failures. While local fallback is active, it periodically performs
-bounded safe repairs of the MBP path and switches Honcho back only after the
-actual remote embeddings endpoint passes consecutive checks.
+The watchdog verifies the real OpenAI-compatible embeddings endpoint on
+MBP2020. If the local Pi bge-m3 probe is unavailable or unsafe, the watchdog
+must leave the current remote config unchanged rather than rewriting it to any
+mxbai/hash fallback.
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ LOCAL_BASE_URL = os.environ.get(
 LOCAL_PROBE_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_OLLAMA_BASE_URL", "http://localhost:11434"
 )
-MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "mxbai-embed-large")
-# The Pi fallback can legitimately take 30-45 seconds while Ollama loads or
-# contends for memory. Keep the watchdog above that observed cold-path latency
-# so a slow but healthy local provider is not misclassified as unavailable.
+MODEL = os.environ.get("HONCHO_EMBEDDING_MODEL", "bge-m3")
+# The Pi bge-m3 probe is intentionally treated as unsafe/unavailable on this
+# host. If it fails, do not rewrite config to any older mxbai/hash fallback;
+# leave the current remote endpoint in place and surface the failure instead.
 EMBEDDING_PROBE_TIMEOUT_SECONDS = float(
     os.environ.get("HONCHO_EMBEDDING_PROBE_TIMEOUT_SECONDS", "60")
 )
@@ -119,7 +119,7 @@ def append_digest_event(event: dict[str, object]) -> None:
         fh.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def http_json(url: str, timeout: float = 4.0) -> tuple[bool, object | str]:
+def http_json(url: str, timeout: float = 30.0) -> tuple[bool, object | str]:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "honcho-embed-watchdog/1"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -667,6 +667,9 @@ def main() -> int:
         return 0
 
     if not local_ok:
+        if args.dry_run:
+            print(json.dumps(summary | {"would_block": "local_fallback_unhealthy"}, indent=2))
+            return 2
         state.update(summary | {"last_status": "blocked_local_unhealthy"})
         save_state(state)
         append_digest_event(

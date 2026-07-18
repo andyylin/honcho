@@ -51,8 +51,9 @@ model = "bge-m3"
 dimensions_mode = "never"
 
 [embedding.MODEL_CONFIG.overrides]
-# Preferred MBP2020 Ollama bridge. The watchdog can fall back to local Pi Ollama
-# at http://host.docker.internal:11434/v1 and auto-restore after verified health.
+# Preferred dedicated MBP2020 Ollama bridge. The watchdog repairs and verifies
+# this same endpoint; Pi-local automatic fallback is intentionally disabled to
+# avoid recreating the 2026-07-17 memory/thermal pressure incident.
 base_url = "http://172.18.0.1:11435/v1"
 api_key_env = "LOCAL_EMBEDDING_API_KEY"
 

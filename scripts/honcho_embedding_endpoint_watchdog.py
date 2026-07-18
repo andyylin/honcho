@@ -75,6 +75,7 @@ REMOTE_SSH_TARGET = os.environ.get(
 REMOTE_OLLAMA_LAUNCH_AGENT = os.environ.get(
     "HONCHO_REMOTE_OLLAMA_LAUNCH_AGENT", "com.andy.ollama-lan"
 )
+REMOTE_OLLAMA_PORT = int(os.environ.get("HONCHO_REMOTE_OLLAMA_PORT", "11435"))
 EMAIL_TARGET = os.environ.get("HONCHO_EMBEDDING_ALERT_TARGET", "email:andylin@gmail.com")
 EMAIL_SUBJECT = os.environ.get(
     "HONCHO_EMBEDDING_ALERT_SUBJECT", "[Hermes][Honcho] Embedding fallback"
@@ -272,7 +273,7 @@ uid=$(id -u)
 agent={REMOTE_OLLAMA_LAUNCH_AGENT!r}
 launchctl kickstart -k "gui/$uid/$agent" 2>/dev/null || true
 for i in 1 2 3 4 5; do
-  if curl -fsS --connect-timeout 2 --max-time 8 http://127.0.0.1:11434/api/tags >/dev/null; then
+  if curl -fsS --connect-timeout 2 --max-time 8 http://127.0.0.1:{REMOTE_OLLAMA_PORT}/api/tags >/dev/null; then
     echo "mbp_ollama_local_ok attempt=$i"
     exit 0
   fi
@@ -440,7 +441,14 @@ def main() -> int:
 
     state = load_state()
     current_url = read_current_base_url()
-    current_is_local = current_url == LOCAL_BASE_URL and not args.force
+    # Setting the local URL equal to the remote URL disables Pi-local fallback.
+    # Do not misclassify that configuration as "currently local": doing so
+    # creates a fake restore loop (remote -> same remote) and can turn a transient
+    # container verification error into a bogus "restore blocked" alert.
+    local_fallback_enabled = LOCAL_BASE_URL != REMOTE_BASE_URL
+    current_is_local = (
+        local_fallback_enabled and current_url == LOCAL_BASE_URL and not args.force
+    )
     remote_probe_base = REMOTE_BASE_URL.removesuffix("/v1")
     remote_ok, remote_tags_reason = probe_ollama(remote_probe_base)
     if remote_ok:
@@ -457,7 +465,11 @@ def main() -> int:
     # watchdog is meant to survive. Honcho's own health check covers the active
     # provider; the watchdog verifies local embeddings immediately before a
     # remote-to-local switch.
-    should_probe_local_fallback = not current_is_local and (args.force or not remote_ok)
+    should_probe_local_fallback = (
+        local_fallback_enabled
+        and not current_is_local
+        and (args.force or not remote_ok)
+    )
     if should_probe_local_fallback:
         local_ok, local_tags_reason = probe_ollama(LOCAL_PROBE_BASE_URL)
         if local_ok:
@@ -469,6 +481,9 @@ def main() -> int:
                 local_reason = f"tags ok ({local_tags_reason}); embeddings failed: {local_reason}"
         else:
             local_reason = local_tags_reason
+    elif not local_fallback_enabled:
+        local_ok = False
+        local_reason = "Pi-local fallback disabled; local and remote base URLs are identical"
     else:
         local_ok = True
         local_reason = "probe skipped; local endpoint is active or not needed as fallback"

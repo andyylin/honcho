@@ -532,7 +532,13 @@ def main() -> int:
         and repair_threshold_reached
         and not args.dry_run
         and not current_is_local
+        and should_repair_remote_from_local(state)
     ):
+        # Apply the repair cooldown while Honcho is still configured to remote,
+        # too. Without this, every long watchdog run restarts the shared tunnel
+        # and remote Ollama again, aborting in-flight work and extending outages.
+        state["last_remote_repair_attempt_epoch"] = time.time()
+        state["last_remote_repair_attempt"] = now()
         repair_output = repair_remote_ollama_endpoint()
         repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
         if repaired_ok:

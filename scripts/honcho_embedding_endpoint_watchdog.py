@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -37,6 +38,12 @@ DIGEST_EVENTS_PATH = Path(
         "/home/pi/.hermes/data/automation-failure-repair/digest-events.jsonl",
     )
 )
+PROBE_LOCK_PATH = Path(
+    os.environ.get(
+        "EMBEDDING_WATCHDOG_PROBE_LOCK",
+        "/home/pi/.cache/embedding-watchdog-probe.lock",
+    )
+)
 
 REMOTE_BASE_URL = os.environ.get(
     "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://172.18.0.1:11435/v1"
@@ -55,6 +62,9 @@ EMBEDDING_PROBE_TIMEOUT_SECONDS = float(
     os.environ.get("HONCHO_EMBEDDING_PROBE_TIMEOUT_SECONDS", "60")
 )
 REMOTE_FAILURE_THRESHOLD = int(os.environ.get("HONCHO_REMOTE_FAILURE_THRESHOLD", "3"))
+OUTAGE_GRACE_SECONDS = int(
+    float(os.environ.get("HONCHO_EMBEDDING_OUTAGE_GRACE_MINUTES", "30")) * 60
+)
 REMOTE_RESTORE_SUCCESS_THRESHOLD = int(
     os.environ.get("HONCHO_REMOTE_RESTORE_SUCCESS_THRESHOLD", "3")
 )
@@ -104,6 +114,68 @@ def save_state(state: dict[str, object]) -> None:
     tmp = STATE_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
     tmp.replace(STATE_PATH)
+
+
+def update_outage_state(
+    state: dict[str, object], *, remote_ok: bool, now_epoch: float | None = None
+) -> tuple[int, float]:
+    """Track one continuous outage and clear every alert latch on recovery."""
+    current_epoch = time.time() if now_epoch is None else now_epoch
+    if remote_ok:
+        state["remote_failure_count"] = 0
+        for key in (
+            "first_remote_failure_epoch",
+            "repair_attempted_for_incident",
+            "incident_alerted",
+            "incident_alerted_epoch",
+        ):
+            state.pop(key, None)
+        return 0, 0.0
+
+    previous = int(state.get("remote_failure_count", 0) or 0)
+    first = float(state.get("first_remote_failure_epoch", current_epoch) or current_epoch)
+    state.setdefault("first_remote_failure_epoch", first)
+    failures = previous + 1
+    state["remote_failure_count"] = failures
+    return failures, max(0.0, current_epoch - first)
+
+
+def incident_ready_to_escalate(
+    state: dict[str, object],
+    *,
+    failure_count: int,
+    now_epoch: float | None = None,
+    failure_threshold: int = REMOTE_FAILURE_THRESHOLD,
+    grace_seconds: int = OUTAGE_GRACE_SECONDS,
+) -> bool:
+    current_epoch = time.time() if now_epoch is None else now_epoch
+    first = float(state.get("first_remote_failure_epoch", current_epoch) or current_epoch)
+    return (
+        failure_count >= failure_threshold
+        and current_epoch - first >= grace_seconds
+        and bool(state.get("repair_attempted_for_incident"))
+    )
+
+
+def claim_incident_alert(state: dict[str, object], *, now_epoch: float | None = None) -> bool:
+    """Atomically-shaped state latch: at most one escalation per outage."""
+    if state.get("incident_alerted"):
+        return False
+    state["incident_alerted"] = True
+    state["incident_alerted_epoch"] = time.time() if now_epoch is None else now_epoch
+    return True
+
+
+def acquire_probe_lock(path: Path = PROBE_LOCK_PATH):
+    """Prevent Honcho and GBrain watchdogs from self-DoSing one Ollama runner."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
 
 
 def append_digest_event(event: dict[str, object]) -> None:
@@ -437,6 +509,11 @@ def main() -> int:
     parser.add_argument("--restore-now", action="store_true", help="switch local fallback back to remote after one passing remote probe")
     args = parser.parse_args()
 
+    probe_lock = acquire_probe_lock()
+    if probe_lock is None:
+        print("[SILENT] another embedding watchdog is probing the shared Ollama runner")
+        return 0
+
     state = load_state()
     current_url = read_current_base_url()
     # Setting the local URL equal to the remote URL disables Pi-local fallback.
@@ -485,17 +562,20 @@ def main() -> int:
     else:
         local_ok = True
         local_reason = "probe skipped; local endpoint is active or not needed as fallback"
-    raw_previous_failures = state.get("remote_failure_count", 0)
-    previous_failures = int(raw_previous_failures) if isinstance(raw_previous_failures, int | str) else 0
-    candidate_failure_count = 0 if remote_ok else previous_failures + 1
+    probe_epoch = time.time()
+    remote_failure_count, outage_age_seconds = update_outage_state(
+        state, remote_ok=remote_ok, now_epoch=probe_epoch
+    )
     repair_output = ""
     repaired_remote = False
 
-    # Under embedding load one probe can miss its deadline while the endpoint
-    # remains healthy. Restarting the shared SSH tunnel on the first miss drops
-    # every in-flight Honcho and GBrain request. Repair only after the same
-    # consecutive-failure threshold that authorizes fallback.
-    repair_threshold_reached = candidate_failure_count >= REMOTE_FAILURE_THRESHOLD
+    # A count alone is not proof of an outage: queued model work can make several
+    # probes miss. Repair only after the endpoint has failed continuously for the
+    # configured grace period as well as crossing the count threshold.
+    repair_threshold_reached = (
+        remote_failure_count >= REMOTE_FAILURE_THRESHOLD
+        and outage_age_seconds >= OUTAGE_GRACE_SECONDS
+    )
 
     # If local fallback is active, periodically try to heal the MBP path and
     # automatically restore only after repeated successful real embedding probes.
@@ -508,6 +588,7 @@ def main() -> int:
     ):
         state["last_remote_repair_attempt_epoch"] = time.time()
         state["last_remote_repair_attempt"] = now()
+        state["repair_attempted_for_incident"] = True
         repair_output = repair_remote_ollama_endpoint()
         repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
         if repaired_ok:
@@ -522,6 +603,9 @@ def main() -> int:
             remote_ok = True
             remote_reason = f"repaired remote endpoint; {repaired_reason}"
             repaired_remote = True
+            remote_failure_count, outage_age_seconds = update_outage_state(
+                state, remote_ok=True
+            )
         else:
             remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
@@ -537,6 +621,7 @@ def main() -> int:
         # and remote Ollama again, aborting in-flight work and extending outages.
         state["last_remote_repair_attempt_epoch"] = time.time()
         state["last_remote_repair_attempt"] = now()
+        state["repair_attempted_for_incident"] = True
         repair_output = repair_remote_ollama_endpoint()
         repaired_ok, repaired_tags_reason = probe_ollama(remote_probe_base)
         if repaired_ok:
@@ -551,10 +636,12 @@ def main() -> int:
             remote_ok = True
             remote_reason = f"repaired remote endpoint; {repaired_reason}"
             repaired_remote = True
+            remote_failure_count, outage_age_seconds = update_outage_state(
+                state, remote_ok=True
+            )
         else:
             remote_reason = f"{remote_reason}; repair attempted but still failing: {repaired_reason}"
 
-    remote_failure_count = 0 if remote_ok else previous_failures + 1
     raw_previous_successes = state.get("remote_success_count", 0)
     previous_successes = int(raw_previous_successes) if isinstance(raw_previous_successes, int | str) else 0
     remote_success_count = previous_successes + 1 if remote_ok else 0
@@ -569,6 +656,8 @@ def main() -> int:
         "remote_failure_threshold": REMOTE_FAILURE_THRESHOLD,
         "remote_restore_success_threshold": REMOTE_RESTORE_SUCCESS_THRESHOLD,
         "remote_failure_count": remote_failure_count,
+        "outage_age_seconds": round(outage_age_seconds, 1),
+        "outage_grace_seconds": OUTAGE_GRACE_SECONDS,
         "remote_success_count": remote_success_count,
         "remote_auto_restore": REMOTE_AUTO_RESTORE,
         "remote_repair_interval_seconds": REMOTE_REPAIR_INTERVAL_SECONDS,
@@ -671,12 +760,19 @@ def main() -> int:
         save_state(state)
         return 0
 
-    if not args.force and remote_failure_count < REMOTE_FAILURE_THRESHOLD:
+    ready_to_escalate = args.force or incident_ready_to_escalate(
+        state,
+        failure_count=remote_failure_count,
+        now_epoch=probe_epoch,
+    )
+    if not ready_to_escalate:
         state.update(summary | {"last_status": "remote_probe_failed_waiting"})
         save_state(state)
         print(
-            "[SILENT] remote probe failed "
-            f"{remote_failure_count}/{REMOTE_FAILURE_THRESHOLD}: {remote_reason}"
+            "[SILENT] remote embedding outage not yet escalation-eligible: "
+            f"failures={remote_failure_count}, age={int(outage_age_seconds)}s/"
+            f"{OUTAGE_GRACE_SECONDS}s, repair_attempted="
+            f"{bool(state.get('repair_attempted_for_incident'))}; {remote_reason}"
         )
         return 0
 
@@ -684,6 +780,16 @@ def main() -> int:
         if args.dry_run:
             print(json.dumps(summary | {"would_block": "local_fallback_unhealthy"}, indent=2))
             return 2
+        if not claim_incident_alert(state):
+            state.update(summary | {"last_status": "blocked_repeat_suppressed"})
+            save_state(state)
+            print("[SILENT] sustained Honcho embedding outage already escalated; awaiting recovery")
+            return 0
+        fallback_detail = (
+            "Pi-local fallback is intentionally disabled by remote-only policy"
+            if not local_fallback_enabled
+            else f"local fallback also failed ({local_reason})"
+        )
         state.update(summary | {"last_status": "blocked_local_unhealthy"})
         save_state(state)
         append_digest_event(
@@ -691,14 +797,18 @@ def main() -> int:
                 "event": "supervisor_triage_completed",
                 "status": "fallback_blocked_local_unhealthy",
                 "outcome": "blocked",
-                "notification": "immediate_email",
-                "reason": f"Remote failed ({remote_reason}); local fallback also failed ({local_reason}).",
-                "repair": "No config change applied because fallback target is unhealthy.",
+                "notification": "supervisor_escalation",
+                "reason": (
+                    f"Remote embedding endpoint remained down for {int(outage_age_seconds)}s "
+                    f"and post-repair verification failed; {fallback_detail}."
+                ),
+                "repair": "Attempted bounded tunnel/Ollama repair; no unsafe config change applied.",
             }
         )
         print(
-            f"Honcho embedding fallback BLOCKED: remote failed ({remote_reason}); "
-            f"local failed ({local_reason}); routed to Supervisor event queue"
+            f"Honcho embedding outage ESCALATED after {int(outage_age_seconds)}s and failed "
+            f"auto-repair: remote failed ({remote_reason}); {fallback_detail}; "
+            "routed to Supervisor event queue"
         )
         return 2
 

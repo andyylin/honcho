@@ -347,15 +347,13 @@ def send_email(body: str, *, subject: str = EMAIL_SUBJECT) -> str:
 
 
 def routine_notification(body: str, *, subject: str, event: dict[str, object]) -> str:
-    """Notify for successful self-healing without spamming Andy.
+    """Record successful self-healing for Supervisor-owned notification routing.
 
     Fallback-to-local and restore-to-MBP are routine successful repairs. By
-    default they go to the daily Supervisor digest. Set
-    HONCHO_EMBEDDING_NOTIFY_MODE=immediate only while debugging the watchdog.
+    architecture, detectors/watchdogs never notify Andy directly; the Supervisor
+    decides whether an event belongs in the digest or needs immediate delivery.
     """
     append_digest_event(event)
-    if NOTIFY_MODE in {"immediate", "email", "all"}:
-        return send_email(body, subject=subject)
     return f"digest event recorded at {DIGEST_EVENTS_PATH}"
 
 
@@ -623,14 +621,9 @@ def main() -> int:
                     "verification": rollback_verify[:1000],
                 }
             )
-            email_result = send_email(
-                "Honcho embedding restore BLOCKED: remote verification failed; "
-                f"rolled back to local.\n\nError:\n{exc}\n\nRollback verification:\n{rollback_verify}",
-                subject="[Hermes][Honcho] Embedding restore blocked",
-            )
             print(
                 "Honcho embedding restore BLOCKED: remote verification failed; "
-                f"rolled back to local. error={exc}; {email_result}"
+                f"rolled back to local. error={exc}; routed to Supervisor event queue"
             )
             return 2
         body = build_restore_body(
@@ -703,14 +696,9 @@ def main() -> int:
                 "repair": "No config change applied because fallback target is unhealthy.",
             }
         )
-        email_result = send_email(
-            "Honcho embedding fallback BLOCKED: remote and local embedding providers failed.\n\n"
-            f"Remote: {remote_reason}\n\nLocal: {local_reason}",
-            subject="[Hermes][Honcho] Embedding fallback blocked",
-        )
         print(
             f"Honcho embedding fallback BLOCKED: remote failed ({remote_reason}); "
-            f"local failed ({local_reason}); {email_result}"
+            f"local failed ({local_reason}); routed to Supervisor event queue"
         )
         return 2
 

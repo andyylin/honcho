@@ -49,7 +49,7 @@ REMOTE_BASE_URL = os.environ.get(
     "HONCHO_REMOTE_EMBEDDING_BASE_URL", "http://172.18.0.1:11435/v1"
 )
 LOCAL_BASE_URL = os.environ.get(
-    "HONCHO_LOCAL_EMBEDDING_BASE_URL", "http://host.docker.internal:11434/v1"
+    "HONCHO_LOCAL_EMBEDDING_BASE_URL", REMOTE_BASE_URL
 )
 LOCAL_PROBE_BASE_URL = os.environ.get(
     "HONCHO_LOCAL_OLLAMA_BASE_URL", "http://localhost:11434"

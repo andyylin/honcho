@@ -133,6 +133,8 @@ def update_outage_state(
         return 0, 0.0
 
     previous = int(state.get("remote_failure_count", 0) or 0)
+    if previous == 0:
+        state.pop("remote_runtime_reload_attempted_for_incident", None)
     first = float(state.get("first_remote_failure_epoch", current_epoch) or current_epoch)
     state.setdefault("first_remote_failure_epoch", first)
     failures = previous + 1
@@ -502,6 +504,30 @@ def should_repair_remote_from_local(state: dict[str, object]) -> bool:
     return (time.time() - last_attempt) >= REMOTE_REPAIR_INTERVAL_SECONDS
 
 
+def should_reload_remote_runtime_after_recovery(
+    state: dict[str, object],
+    *,
+    current_url: str,
+    remote_ok: bool,
+    current_is_local: bool,
+    remote_url: str = REMOTE_BASE_URL,
+) -> bool:
+    """Reload a remote-only runtime after its bounded outage repair recovers.
+
+    In remote-only mode the config can already point at the remote endpoint while
+    the running Honcho processes still hold an older local endpoint in memory.
+    A completed repair attempt is the incident-scoped latch that makes one reload
+    appropriate when the real remote embedding probe becomes healthy again.
+    """
+    return (
+        remote_ok
+        and not current_is_local
+        and current_url == remote_url
+        and bool(state.get("repair_attempted_for_incident"))
+        and not bool(state.get("remote_runtime_reload_attempted_for_incident"))
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true", help="probe and report without changing config")
@@ -562,6 +588,12 @@ def main() -> int:
     else:
         local_ok = True
         local_reason = "probe skipped; local endpoint is active or not needed as fallback"
+    reload_remote_runtime = should_reload_remote_runtime_after_recovery(
+        state,
+        current_url=current_url,
+        remote_ok=remote_ok,
+        current_is_local=current_is_local,
+    )
     probe_epoch = time.time()
     remote_failure_count, outage_age_seconds = update_outage_state(
         state, remote_ok=remote_ok, now_epoch=probe_epoch
@@ -756,6 +788,42 @@ def main() -> int:
         return 0
 
     if remote_ok and not args.force:
+        if reload_remote_runtime:
+            if args.dry_run:
+                print(json.dumps(summary | {"would_reload_remote_runtime": True}, indent=2))
+                return 0
+            # Persist the one-shot latch before changing container lifecycle so a
+            # failed verification cannot create a two-minute restart loop.
+            state["remote_runtime_reload_attempted_for_incident"] = True
+            save_state(state)
+            restart_output = restart_honcho()
+            verify_output = verify_container_embedding()
+            append_digest_event(
+                {
+                    "event": "supervisor_auto_repair_completed",
+                    "status": "remote_runtime_reloaded_after_recovery",
+                    "outcome": "silent_digest",
+                    "notification": "silent_digest_ledger_only",
+                    "reason": (
+                        "Remote-only embedding endpoint recovered after a bounded "
+                        "repair attempt; reloaded Honcho to discard stale runtime config."
+                    ),
+                    "repair": "Restarted Honcho api/deriver with the configured remote endpoint.",
+                    "verification": verify_output[:1000],
+                }
+            )
+            state.update(
+                summary
+                | {
+                    "last_status": "remote_runtime_reloaded_after_recovery",
+                    "remote_failure_count": 0,
+                    "restart_output": restart_output,
+                    "verify_output": verify_output,
+                }
+            )
+            save_state(state)
+            print("Honcho remote embedding runtime reloaded after endpoint recovery")
+            return 0
         state.update(summary | {"last_status": "remote_ok", "remote_failure_count": 0})
         save_state(state)
         return 0

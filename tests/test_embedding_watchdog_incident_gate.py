@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "honcho_embedding_endpoint_watchdog.py"
 spec = importlib.util.spec_from_file_location("honcho_embedding_watchdog", MODULE_PATH)
 assert spec is not None and spec.loader is not None
@@ -53,6 +52,14 @@ class IncidentGateTests(unittest.TestCase):
         self.assertTrue(watchdog.claim_incident_alert(state, now_epoch=2000.0))
         self.assertFalse(watchdog.claim_incident_alert(state, now_epoch=2100.0))
 
+    def test_new_outage_clears_prior_runtime_reload_latch(self):
+        state = {"remote_runtime_reload_attempted_for_incident": True}
+        failures, age = watchdog.update_outage_state(
+            state, remote_ok=False, now_epoch=100.0
+        )
+        self.assertEqual((failures, age), (1, 0.0))
+        self.assertNotIn("remote_runtime_reload_attempted_for_incident", state)
+
     def test_recovery_clears_outage_and_alert_latch(self):
         state = {
             "remote_failure_count": 9,
@@ -70,6 +77,51 @@ class IncidentGateTests(unittest.TestCase):
             "incident_alerted_epoch",
         ):
             self.assertNotIn(key, state)
+
+    def test_remote_only_recovery_reloads_runtime_after_repair_attempt(self):
+        state = {"repair_attempted_for_incident": True}
+        self.assertTrue(
+            watchdog.should_reload_remote_runtime_after_recovery(
+                state,
+                current_url="http://remote.test/v1",
+                remote_ok=True,
+                current_is_local=False,
+                remote_url="http://remote.test/v1",
+            )
+        )
+
+    def test_remote_runtime_reload_is_incident_scoped(self):
+        cases = (
+            ({}, "http://remote.test/v1", True, False),
+            (
+                {
+                    "repair_attempted_for_incident": True,
+                    "remote_runtime_reload_attempted_for_incident": True,
+                },
+                "http://remote.test/v1",
+                True,
+                False,
+            ),
+            ({"repair_attempted_for_incident": True}, "http://remote.test/v1", False, False),
+            ({"repair_attempted_for_incident": True}, "http://local.test/v1", True, True),
+            ({"repair_attempted_for_incident": True}, "http://other.test/v1", True, False),
+        )
+        for state, current_url, remote_ok, current_is_local in cases:
+            with self.subTest(
+                state=state,
+                current_url=current_url,
+                remote_ok=remote_ok,
+                current_is_local=current_is_local,
+            ):
+                self.assertFalse(
+                    watchdog.should_reload_remote_runtime_after_recovery(
+                        state,
+                        current_url=current_url,
+                        remote_ok=remote_ok,
+                        current_is_local=current_is_local,
+                        remote_url="http://remote.test/v1",
+                    )
+                )
 
 
 if __name__ == "__main__":

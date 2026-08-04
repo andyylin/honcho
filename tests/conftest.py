@@ -78,6 +78,8 @@ _RUNTIME_MOCK_TEST_BLOCKLIST_PREFIXES = (
     # LLM transport tests mock providers directly and don't need database/runtime setup.
     "tests/utils/test_length_finish_reason.py",
     "tests/utils/test_clients.py",
+    # Host watchdog policy tests are pure units and must not require the app database.
+    "tests/test_embedding_watchdog_incident_gate.py",
 )
 
 _LIVE_LLM_MARKER = "live_llm"
